@@ -380,6 +380,14 @@ class PipecatProvider(ConversationProvider):
         self._barge_in_active: bool = False
         self._barge_in_generation: int = 0
 
+        # Barge-in master switch. When OFF (default), the bot talks
+        # uninterrupted — pipecat's allow_interruptions is False, the
+        # PipelineSink ignores VAD-start drains, and the AEC isn't loaded.
+        # User speech during bot speech is buffered and processed as the
+        # next turn once the bot finishes. When ON, AEC + queue-drain +
+        # pipecat interruption all engage so the user can cut the bot off.
+        self._barge_in_enabled = os.environ.get("BARGE_IN_ENABLED", "0").lower() not in ("0", "false", "no", "off")
+
         # Acoustic echo canceller — subtracts TTS playback from the mic so
         # Silero VAD can detect the user's voice over the bot's own speaker.
         # Without this, the built-in speaker/mic of the Reachy Mini masks
@@ -387,7 +395,7 @@ class PipecatProvider(ConversationProvider):
         from reachy_mini_conversation_app.audio.echo_canceller import (
             AcousticEchoCanceller,
         )
-        _aec_enabled = os.environ.get("AEC_ENABLED", "1").lower() not in ("0", "false", "no", "off")
+        _aec_enabled = self._barge_in_enabled and os.environ.get("AEC_ENABLED", "1").lower() not in ("0", "false", "no", "off")
         self._aec: AcousticEchoCanceller | None = None
         if _aec_enabled:
             self._aec = AcousticEchoCanceller(
@@ -396,9 +404,9 @@ class PipecatProvider(ConversationProvider):
                 sample_rate=PIPELINE_SAMPLE_RATE,
                 mu=float(os.environ.get("AEC_MU", "0.3")),
             )
-            logger.info("AEC enabled (NLMS, 16 kHz, 200 ms tail)")
+            logger.info("Barge-in ON; AEC enabled (NLMS, 16 kHz, 200 ms tail)")
         else:
-            logger.info("AEC disabled (AEC_ENABLED=0)")
+            logger.info("Barge-in %s; AEC off", "ON" if self._barge_in_enabled else "OFF")
 
         # Health tracking
         self._frames_dropped: int = 0
@@ -1235,46 +1243,48 @@ class PipecatProvider(ConversationProvider):
                 # The robot should always be listening when idle — only
                 # TTS playback (above) temporarily clears the flag.
                 elif isinstance(frame, VADUserStartedSpeakingFrame):
-                    provider_ref._barge_in_generation += 1
-                    provider_ref._barge_in_active = True
+                    # Always-on: track listening state for idle movement.
                     provider_ref.deps.movement_manager.set_listening(True)
                     if provider_ref.deps.head_wobbler is not None:
                         provider_ref.deps.head_wobbler.reset()
                     if provider_ref._doa_tracker is not None:
                         provider_ref._doa_tracker.set_enabled(True)
-                    # Drop queued speaker reference (we just drained the output
-                    # queue, so those samples won't actually play — feeding them
-                    # as reference would cancel echo that isn't there). Keep the
-                    # learned filter weights — the hardware echo path is stable
-                    # across turns, and wiping them forces re-convergence.
-                    if provider_ref._aec is not None:
-                        provider_ref._aec.clear_buffer()
-                    # Barge-in: drain ALL pending audio from the output
-                    # queue so the robot stops talking immediately.
-                    # Preserve transcript AdditionalOutputs (non-audio).
-                    kept: list = []
-                    while not provider_ref.output_queue.empty():
-                        try:
-                            item = provider_ref.output_queue.get_nowait()
-                            if isinstance(item, AdditionalOutputs):
-                                kept.append(item)
-                            # else: discard audio tuples
-                        except asyncio.QueueEmpty:
-                            break
-                    for item in kept:
-                        try:
-                            provider_ref.output_queue.put_nowait(item)
-                        except asyncio.QueueFull:
-                            pass  # acceptable during congestion
-                    # Also flush the robot's GStreamer player buffer so
-                    # already-pushed audio stops immediately.
-                    clear_fn = getattr(provider_ref, "_clear_queue", None)
-                    if clear_fn is not None:
-                        try:
-                            clear_fn()
-                        except Exception as exc:
-                            logger.debug("clear_queue during barge-in: %s", exc)
-                    logger.debug("User speech started (barge-in, drained audio + player)")
+                    # Barge-in only: cut off the bot's current speech.
+                    if provider_ref._barge_in_enabled:
+                        provider_ref._barge_in_generation += 1
+                        provider_ref._barge_in_active = True
+                        # Drop queued speaker reference (we just drained the
+                        # output queue, so those samples won't actually play —
+                        # feeding them as reference would cancel echo that
+                        # isn't there). Keep the learned filter weights.
+                        if provider_ref._aec is not None:
+                            provider_ref._aec.clear_buffer()
+                        # Drain ALL pending audio from the output queue so the
+                        # robot stops talking immediately. Preserve transcript
+                        # AdditionalOutputs (non-audio).
+                        kept: list = []
+                        while not provider_ref.output_queue.empty():
+                            try:
+                                item = provider_ref.output_queue.get_nowait()
+                                if isinstance(item, AdditionalOutputs):
+                                    kept.append(item)
+                                # else: discard audio tuples
+                            except asyncio.QueueEmpty:
+                                break
+                        for item in kept:
+                            try:
+                                provider_ref.output_queue.put_nowait(item)
+                            except asyncio.QueueFull:
+                                pass  # acceptable during congestion
+                        # Also flush the robot's GStreamer player buffer so
+                        # already-pushed audio stops immediately.
+                        clear_fn = getattr(provider_ref, "_clear_queue", None)
+                        if clear_fn is not None:
+                            try:
+                                clear_fn()
+                            except Exception as exc:
+                                logger.debug("clear_queue during barge-in: %s", exc)
+                        logger.debug("User speech started (barge-in, drained audio + player)")
 
                 elif isinstance(frame, VADUserStoppedSpeakingFrame):
                     # Clear barge-in flag so next LLM response audio plays
@@ -1714,7 +1724,7 @@ class PipecatProvider(ConversationProvider):
         task = PipelineTask(
             pipeline,
             params=PipelineParams(
-                allow_interruptions=True,
+                allow_interruptions=self._barge_in_enabled,
                 audio_in_sample_rate=PIPELINE_SAMPLE_RATE,
                 audio_out_sample_rate=FASTRTC_SAMPLE_RATE,
                 enable_metrics=True,
