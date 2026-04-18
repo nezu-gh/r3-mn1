@@ -2,13 +2,9 @@
 
 Belt-and-suspenders for residual speaker→mic leakage that slips past the AEC:
 if an ASR transcription has high word overlap with something the robot just
-said, drop it. Pattern cribbed from algal/sparky's ``_looks_like_echo_of_tts``
-(``state_machine.py:1577``).
-
-Kept deliberately simple — word set containment plus a short time window.
-False positives (user legitimately repeating a word the bot said ~seconds ago)
-are possible but rare; the window cap keeps them to cases where it's genuinely
-ambiguous.
+said, drop it. Algorithm lifted from algal/sparky's `_looks_like_echo_of_tts`
+(``sparky_mvp/core/state_machine.py:1577-1619``). Kept close to the original
+so behaviour is directly comparable.
 """
 
 from __future__ import annotations
@@ -18,54 +14,107 @@ import time
 from collections import deque
 
 
-_WORD_RE = re.compile(r"[a-zA-ZäöüÄÖÜß0-9]+")
+# Non-alphanumeric -> single space. Lowercases first.
+_ECHO_RE = re.compile(r"[^a-z0-9]+")
 
 
-def _tokens(text: str) -> set[str]:
-    return {m.group(0).lower() for m in _WORD_RE.finditer(text)}
+def normalize_text_for_echo(text: str) -> str:
+    t = (text or "").lower().strip()
+    t = _ECHO_RE.sub(" ", t)
+    return " ".join(t.split())
+
+
+def _words_for_echo(norm_text: str) -> set[str]:
+    # Skip very short tokens which contribute mostly noise.
+    return {w for w in norm_text.split() if len(w) >= 3}
 
 
 class RecentTTSTextGuard:
-    """Rolling set of recent TTS sentences with an echo-match check."""
+    """Rolling buffer of recent TTS sentences with a sparky-style echo check.
 
-    def __init__(self, window_secs: float = 3.0, threshold: float = 0.6, max_entries: int = 16) -> None:
-        """Initialise the guard.
+    Each entry stores (monotonic_timestamp, normalized_text). The guard tests
+    an ASR transcript against every buffered entry within ``window_secs`` and
+    returns True if any of the following hold:
 
-        Args:
-            window_secs: How long a TTS sentence is considered a possible
-                echo source. Short enough that legitimate repetition of
-                earlier content isn't swallowed.
-            threshold: Containment score in [0, 1] at or above which a
-                transcript is treated as an echo. 0.6 means ~60% of the
-                user's words overlap with the TTS.
-            max_entries: Cap on the buffer so it doesn't grow unbounded
-                in long sessions.
-        """
+      - the transcript is a substring of the TTS sentence (≥ ``min_chars``);
+      - word-set Jaccard ≥ ``threshold``;
+      - user-containment (|∩| / |user|) ≥ ``threshold``;
+      - tts-containment (|∩| / |tts|)  ≥ ``threshold``;
+
+    subject to a minimum overlap size that scales down for short utterances.
+    """
+
+    def __init__(
+        self,
+        window_secs: float = 12.0,
+        threshold: float = 0.78,
+        min_overlap: int = 6,
+        min_chars: int = 8,
+        max_entries: int = 200,
+    ) -> None:
         self._window_secs = window_secs
         self._threshold = threshold
-        self._entries: deque[tuple[float, set[str]]] = deque(maxlen=max_entries)
+        self._min_overlap = min_overlap
+        self._min_chars = min_chars
+        self._entries: deque[tuple[float, str]] = deque(maxlen=max_entries)
 
     def note(self, text: str) -> None:
         """Record a TTS sentence so future transcripts can be checked against it."""
-        tokens = _tokens(text)
-        if not tokens:
+        norm = normalize_text_for_echo(text)
+        if not norm:
             return
-        self._entries.append((time.monotonic(), tokens))
+        now = time.monotonic()
+        self._entries.append((now, norm))
+        # Prune by time window
+        cutoff = now - self._window_secs
+        while self._entries and self._entries[0][0] < cutoff:
+            self._entries.popleft()
 
     def looks_like_echo(self, text: str) -> bool:
-        """Return True if *text*'s words are mostly contained in recent TTS."""
-        user_tokens = _tokens(text)
-        if not user_tokens:
+        """Return True if *text* looks like an echo of recent TTS output."""
+        user_norm = normalize_text_for_echo(text)
+        if not user_norm:
             return False
-        cutoff = time.monotonic() - self._window_secs
-        for ts, tts_tokens in self._entries:
-            if ts < cutoff:
+        user_words = _words_for_echo(user_norm)
+        if not self._entries:
+            return False
+
+        now = time.monotonic()
+        for ts, tts_norm in reversed(self._entries):
+            if now - ts > self._window_secs:
+                break
+            tts_words = _words_for_echo(tts_norm)
+            if not tts_words:
                 continue
-            if not tts_tokens:
-                continue
-            overlap = len(user_tokens & tts_tokens) / len(user_tokens)
-            if overlap >= self._threshold:
+
+            # Short-utterance echo (e.g., "oh wonderful") should still be
+            # blocked if the transcript is literally a substring of the
+            # TTS sentence.
+            if len(user_norm) >= self._min_chars and user_norm in tts_norm:
                 return True
+
+            inter = user_words & tts_words
+            # Scale the overlap requirement down for short utterances so
+            # "wonderful" vs "oh wonderful" can still match.
+            required_overlap = min(
+                self._min_overlap,
+                max(1, min(len(user_words), len(tts_words))),
+            )
+            if len(inter) < required_overlap:
+                continue
+
+            union = user_words | tts_words
+            jaccard = (len(inter) / len(union)) if union else 0.0
+            contain_user = len(inter) / max(1, len(user_words))
+            contain_tts = len(inter) / max(1, len(tts_words))
+
+            if (
+                jaccard >= self._threshold
+                or contain_user >= self._threshold
+                or contain_tts >= self._threshold
+            ):
+                return True
+
         return False
 
     def clear(self) -> None:

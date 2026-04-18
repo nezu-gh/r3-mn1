@@ -379,6 +379,11 @@ class PipecatProvider(ConversationProvider):
         # Barge-in: generation counter prevents stale clears from racing
         self._barge_in_active: bool = False
         self._barge_in_generation: int = 0
+        # Delayed-commit handle. VAD-start schedules _commit_barge_in via
+        # loop.call_later; VAD-stop cancels it if it hasn't fired yet. This
+        # suppresses sub-threshold VAD bursts caused by echo leakage that
+        # would otherwise kill the bot mid-sentence.
+        self._pending_barge_in_handle: Any = None
 
         # Barge-in master switch. When OFF (default), the bot talks
         # uninterrupted — pipecat's allow_interruptions is False, the
@@ -387,6 +392,37 @@ class PipecatProvider(ConversationProvider):
         # next turn once the bot finishes. When ON, AEC + queue-drain +
         # pipecat interruption all engage so the user can cut the bot off.
         self._barge_in_enabled = os.environ.get("BARGE_IN_ENABLED", "0").lower() not in ("0", "false", "no", "off")
+        # Minimum VAD-active duration before a barge-in is committed. Shorter
+        # bursts (echo leakage, impulsive noise) are ignored. 400 ms filters
+        # out the ~75-350 ms echo bursts we see in the wild without noticeably
+        # delaying real user interruptions.
+        self._barge_in_min_vad_s = float(os.environ.get("BARGE_IN_MIN_VAD_S", "0.4"))
+        # Only treat VAD-start as a potential barge-in if the bot played TTS
+        # within this window. Outside the window there is nothing to interrupt
+        # and a "barge-in" would just drop the next reply before it starts.
+        self._barge_in_tts_window_s = float(os.environ.get("BARGE_IN_TTS_WINDOW_S", "1.5"))
+        # Half-duplex vs full-duplex during bot speech — sparky aligns. When
+        # BARGE_IN_WHILE_SPEAKING=0 (default), the mic is gated off entirely
+        # while the bot is speaking; real user speech becomes the next turn
+        # after the bot finishes. When =1, mic frames pass if their RMS is
+        # above BARGE_IN_SPEAKING_RMS (sparky default 0.15) — residual echo
+        # below that floor is rejected before VAD/STT ever sees it.
+        self._barge_in_while_speaking = os.environ.get("BARGE_IN_WHILE_SPEAKING", "0").lower() not in ("0", "false", "no", "off")
+        self._barge_in_speaking_rms = float(os.environ.get("BARGE_IN_SPEAKING_RMS", "0.15"))
+        # Counters for dropped mic frames — periodic debug logging only.
+        self._mic_dropped_half_duplex: int = 0
+        self._mic_dropped_low_rms: int = 0
+        # Bot-speaking state — sparky-style debounced tracker. Flips True on
+        # any TTS audio frame flowing to the sink; flips False only after
+        # _bot_speaking_debounce_s seconds of no TTS audio. Pipecat's stock
+        # output transports emit Bot*SpeakingFrame for us; our custom fastrtc
+        # sink does not, and without it MinWordsUserTurnStartStrategy thinks
+        # the bot is never speaking and silently drops its threshold to 1 on
+        # every transcript. This tracker closes that gap and also smooths out
+        # inter-sentence gaps that per-frame shims leave open.
+        self._bot_speaking: bool = False
+        self._bot_stop_debounce: Any = None  # asyncio.TimerHandle
+        self._bot_speaking_debounce_s = float(os.environ.get("BOT_SPEAKING_DEBOUNCE_S", "0.8"))
 
         # Acoustic echo canceller — subtracts TTS playback from the mic so
         # Silero VAD can detect the user's voice over the bot's own speaker.
@@ -404,24 +440,39 @@ class PipecatProvider(ConversationProvider):
                 sample_rate=PIPELINE_SAMPLE_RATE,
                 mu=float(os.environ.get("AEC_MU", "0.3")),
             )
-            logger.info("Barge-in ON; AEC enabled (NLMS, 16 kHz, 200 ms tail)")
+            logger.info(
+                "Barge-in ON (%s); AEC enabled (NLMS, 16 kHz, 200 ms tail)",
+                "full-duplex, RMS>%.2f" % self._barge_in_speaking_rms
+                if self._barge_in_while_speaking
+                else "half-duplex",
+            )
         else:
             logger.info("Barge-in %s; AEC off", "ON" if self._barge_in_enabled else "OFF")
 
         # Text-level echo guard — rejects ASR transcripts whose words mostly
         # match something the robot said in the last few seconds. Catches the
-        # rare echo that slips past the AEC. Off when barge-in is off (there
-        # is no TTS-during-user-speech for this to defend against).
+        # rare echo that slips past the AEC. Parameters and env var names
+        # deliberately match sparky (state_machine.py:1577-1619) so the two
+        # projects stay easy to cross-reference.
         self._echo_guard = None
         if self._barge_in_enabled and os.environ.get("ECHO_GUARD_ENABLED", "1").lower() not in ("0", "false", "no", "off"):
             from reachy_mini_conversation_app.audio.echo_text_guard import (
                 RecentTTSTextGuard,
             )
+            _eg_window = float(os.environ.get("ECHO_GUARD_WINDOW_S", "12.0"))
+            _eg_threshold = float(os.environ.get("ECHO_GUARD_JACCARD", "0.78"))
+            _eg_min_overlap = int(os.environ.get("ECHO_GUARD_MIN_OVERLAP", "6"))
+            _eg_min_chars = int(os.environ.get("ECHO_GUARD_MIN_CHARS", "8"))
             self._echo_guard = RecentTTSTextGuard(
-                window_secs=float(os.environ.get("ECHO_GUARD_WINDOW_SECS", "3.0")),
-                threshold=float(os.environ.get("ECHO_GUARD_THRESHOLD", "0.6")),
+                window_secs=_eg_window,
+                threshold=_eg_threshold,
+                min_overlap=_eg_min_overlap,
+                min_chars=_eg_min_chars,
             )
-            logger.info("Echo guard enabled (window=3.0s threshold=0.6)")
+            logger.info(
+                "Echo guard enabled (window=%.1fs jaccard=%.2f min_overlap=%d min_chars=%d)",
+                _eg_window, _eg_threshold, _eg_min_overlap, _eg_min_chars,
+            )
 
         # Health tracking
         self._frames_dropped: int = 0
@@ -439,6 +490,54 @@ class PipecatProvider(ConversationProvider):
             "pipeline_events": [],  # last N pipeline events
         }
         self._ttfb_history: dict[str, list[float]] = {}  # processor → last 10 values
+
+    # ------------------------------------------------------------------
+    # Barge-in commit (delayed from VAD-start by _barge_in_min_vad_s)
+    # ------------------------------------------------------------------
+
+    def _commit_barge_in(self) -> None:
+        """Flip the barge-in flag and drain in-flight TTS state.
+
+        Called from a loop.call_later timer scheduled by
+        VADUserStartedSpeakingFrame. If VADUserStoppedSpeakingFrame fired
+        first, the handle was cancelled and this never runs.
+        """
+        self._pending_barge_in_handle = None
+        if self._barge_in_active:
+            return  # already committed by an earlier call
+        self._barge_in_generation += 1
+        self._barge_in_active = True
+        # (1) Drain our fastrtc output queue — preserve AdditionalOutputs
+        # (non-audio) so transcripts survive.
+        kept: list = []
+        while not self.output_queue.empty():
+            try:
+                item = self.output_queue.get_nowait()
+                if isinstance(item, AdditionalOutputs):
+                    kept.append(item)
+            except asyncio.QueueEmpty:
+                break
+        for item in kept:
+            try:
+                self.output_queue.put_nowait(item)
+            except asyncio.QueueFull:
+                pass
+        # (2) Flush the robot's GStreamer player buffer so already-pushed
+        # audio stops immediately.
+        clear_fn = getattr(self, "_clear_queue", None)
+        if clear_fn is not None:
+            try:
+                clear_fn()
+            except Exception as exc:
+                logger.debug("clear_queue during barge-in: %s", exc)
+        # (3) Drop queued AEC reference. Keep the learned filter weights —
+        # the speaker→mic path doesn't change between turns.
+        if self._aec is not None:
+            self._aec.clear_buffer()
+        logger.debug(
+            "Barge-in committed after %.0f ms VAD gate (queue + player + AEC cleared)",
+            self._barge_in_min_vad_s * 1000,
+        )
 
     # ------------------------------------------------------------------
     # ConversationProvider abstract methods
@@ -513,6 +612,34 @@ class PipecatProvider(ConversationProvider):
             cleaned = self._aec.process_mic_chunk(audio.tobytes())
             audio = np.frombuffer(cleaned, dtype=np.int16).copy()
 
+        # Sparky-style duplex gate. When the bot is speaking:
+        #   - half-duplex (default): drop the frame entirely. No VAD, no STT,
+        #     no self-interrupt is possible. User speech becomes the next
+        #     turn after the bot finishes.
+        #   - full-duplex (BARGE_IN_WHILE_SPEAKING=1): require post-AEC RMS
+        #     above BARGE_IN_SPEAKING_RMS. Residual echo below the floor is
+        #     rejected before VAD ever runs on it. Real user speech exceeds
+        #     the floor and passes through normally.
+        if self._barge_in_enabled and self._bot_speaking:
+            if not self._barge_in_while_speaking:
+                self._mic_dropped_half_duplex += 1
+                if self._mic_dropped_half_duplex % 200 == 1:
+                    logger.debug(
+                        "Half-duplex: dropped %d mic frames while bot speaking",
+                        self._mic_dropped_half_duplex,
+                    )
+                return
+            # Normalized RMS in [0, 1]. int16 range is +/-32768.
+            rms = float(np.sqrt(np.mean(audio.astype(np.float64) ** 2))) / 32768.0
+            if rms < self._barge_in_speaking_rms:
+                self._mic_dropped_low_rms += 1
+                if self._mic_dropped_low_rms % 200 == 1:
+                    logger.debug(
+                        "Full-duplex RMS gate: dropped %d mic frames below %.2f",
+                        self._mic_dropped_low_rms, self._barge_in_speaking_rms,
+                    )
+                return
+
         logger.debug("receive: sr=%d dtype=%s samples=%d", PIPELINE_SAMPLE_RATE, audio.dtype, len(audio))
         try:
             self._audio_in_queue.put_nowait((PIPELINE_SAMPLE_RATE, audio))
@@ -582,6 +709,8 @@ class PipecatProvider(ConversationProvider):
             InterimTranscriptionFrame,
             VADUserStartedSpeakingFrame,
             VADUserStoppedSpeakingFrame,
+            BotStartedSpeakingFrame,
+            BotStoppedSpeakingFrame,
         )
         from pipecat.pipeline.task import PipelineTask, PipelineParams
         from pipecat.pipeline.runner import PipelineRunner
@@ -873,6 +1002,21 @@ class PipecatProvider(ConversationProvider):
                     if cleaned != text:
                         frame.text = cleaned
                         text = cleaned
+                    # Half-duplex transcript gate. The receive()-level mic
+                    # gate drops audio while the bot is speaking, but STT
+                    # may already have buffered audio from moments before
+                    # bot-start and emit a late transcript. Letting it
+                    # through causes pipecat's broadcast_interruption to
+                    # cut the bot off mid-sentence. In half-duplex mode we
+                    # swallow any transcript arriving while bot_speaking=True.
+                    if (provider_ref_for_cleaner._barge_in_enabled
+                            and provider_ref_for_cleaner._bot_speaking
+                            and not provider_ref_for_cleaner._barge_in_while_speaking):
+                        logger.debug(
+                            "Half-duplex: dropped late transcript during bot speech: %r",
+                            text[:80],
+                        )
+                        return
                     if _is_noise(text):
                         logger.debug("ASR noise filtered: %r", text)
                         return
@@ -1168,9 +1312,56 @@ class PipecatProvider(ConversationProvider):
         class PipelineSink(FrameProcessor):
             """Intercepts output frames and bridges them to fastrtc."""
 
+            async def _emit_bot_stopped_speaking(self) -> None:
+                """Fire after the debounce elapses with no further TTS audio."""
+                if not provider_ref._bot_speaking:
+                    return
+                provider_ref._bot_speaking = False
+                try:
+                    await self.push_frame(BotStoppedSpeakingFrame(), FrameDirection.UPSTREAM)
+                except Exception as exc:
+                    logger.debug("BotStoppedSpeakingFrame push failed: %s", exc)
+                logger.debug(
+                    "Bot stopped speaking (no TTS audio for %.2fs)",
+                    provider_ref._bot_speaking_debounce_s,
+                )
+
             async def process_frame(self, frame: Any, direction: FrameDirection) -> None:
                 # Let base class handle lifecycle (StartFrame → __start, etc.)
                 await super().process_frame(frame, direction)
+
+                # Debounced bot-speaking tracker — sparky-style.
+                # Any TTS audio frame flips _bot_speaking=True (with an
+                # upstream BotStartedSpeakingFrame for MinWordsUserTurnStart
+                # Strategy). A timer N seconds after the *last* audio frame
+                # flips it back to False (and emits BotStoppedSpeakingFrame).
+                # This closes the inter-sentence gap where per-frame shims
+                # would briefly show bot_speaking=False and let a 1-word
+                # echo transcript drop the interrupt threshold to 1.
+                if isinstance(frame, (OutputAudioRawFrame, TTSAudioRawFrame)):
+                    if not provider_ref._bot_speaking:
+                        provider_ref._bot_speaking = True
+                        try:
+                            await self.push_frame(BotStartedSpeakingFrame(), FrameDirection.UPSTREAM)
+                        except Exception as exc:
+                            logger.debug("BotStartedSpeakingFrame push failed: %s", exc)
+                        logger.debug("Bot started speaking (TTS audio flowing)")
+                    # Reset the stop debounce. call_later takes a sync fn;
+                    # schedule the async emit as a task.
+                    h = provider_ref._bot_stop_debounce
+                    if h is not None:
+                        try:
+                            h.cancel()
+                        except Exception:
+                            pass
+                    sink_ref = self
+                    def _schedule_stop() -> None:
+                        provider_ref._bot_stop_debounce = None
+                        asyncio.create_task(sink_ref._emit_bot_stopped_speaking())
+                    loop = asyncio.get_event_loop()
+                    provider_ref._bot_stop_debounce = loop.call_later(
+                        provider_ref._bot_speaking_debounce_s, _schedule_stop,
+                    )
 
                 # TTS audio → output queue + head wobbler
                 # While the robot is speaking, suppress listening so
@@ -1240,8 +1431,16 @@ class PipecatProvider(ConversationProvider):
 
                 # Final user transcript
                 elif isinstance(frame, TranscriptionFrame):
-                    # Clear barge-in on transcript — ensures the flag is
-                    # reset even if VADUserStoppedSpeakingFrame was lost.
+                    # Belt-and-suspenders: VAD-stop already cleared the flag
+                    # and cancelled any pending commit; repeat here in case
+                    # either was lost.
+                    h = provider_ref._pending_barge_in_handle
+                    if h is not None:
+                        try:
+                            h.cancel()
+                        except Exception:
+                            pass
+                        provider_ref._pending_barge_in_handle = None
                     provider_ref._barge_in_active = False
                     provider_ref._last_stt_time = asyncio.get_event_loop().time()
                     text = getattr(frame, "text", "")
@@ -1288,54 +1487,55 @@ class PipecatProvider(ConversationProvider):
                         provider_ref.deps.head_wobbler.reset()
                     if provider_ref._doa_tracker is not None:
                         provider_ref._doa_tracker.set_enabled(True)
-                    # Barge-in only: cut off the bot's current speech.
-                    # Order matters — set the flag first (blocks the TTS-audio
-                    # branch above from feeding the AEC with frames whose
-                    # audio we're about to discard), then drain downstream
-                    # buffers (our own output queue → robot's GStreamer queue),
-                    # then clear the AEC reference last so it matches the
-                    # (now empty) speaker state. Sparky calls these the same
-                    # atomic block for the same reason.
+                    # Barge-in: schedule a delayed commit. VAD-start alone
+                    # is not enough — echo leakage from the bot's own voice
+                    # produces short bursts (75-500 ms) that would
+                    # otherwise cut the bot off mid-sentence. We wait
+                    # _barge_in_min_vad_s; if VAD-stop fires before the
+                    # timer, we cancel. We also gate on "bot played TTS
+                    # within _barge_in_tts_window_s" because there's
+                    # nothing to interrupt otherwise.
                     if provider_ref._barge_in_enabled:
-                        provider_ref._barge_in_generation += 1
-                        provider_ref._barge_in_active = True
-                        # (1) Drain our fastrtc output queue — preserve
-                        # AdditionalOutputs (non-audio) so transcripts survive.
-                        kept: list = []
-                        while not provider_ref.output_queue.empty():
-                            try:
-                                item = provider_ref.output_queue.get_nowait()
-                                if isinstance(item, AdditionalOutputs):
-                                    kept.append(item)
-                                # else: discard audio tuples
-                            except asyncio.QueueEmpty:
-                                break
-                        for item in kept:
-                            try:
-                                provider_ref.output_queue.put_nowait(item)
-                            except asyncio.QueueFull:
-                                pass  # acceptable during congestion
-                        # (2) Flush the robot's GStreamer player buffer so
-                        # already-pushed audio stops immediately.
-                        clear_fn = getattr(provider_ref, "_clear_queue", None)
-                        if clear_fn is not None:
-                            try:
-                                clear_fn()
-                            except Exception as exc:
-                                logger.debug("clear_queue during barge-in: %s", exc)
-                        # (3) Drop queued AEC reference (those samples won't
-                        # actually play, so keeping them would subtract echo
-                        # that isn't there). Keep the learned filter weights.
-                        if provider_ref._aec is not None:
-                            provider_ref._aec.clear_buffer()
-                        logger.debug("User speech started (barge-in: queue + player + AEC cleared)")
+                        now = asyncio.get_event_loop().time()
+                        tts_age = now - provider_ref._last_tts_time if provider_ref._last_tts_time else 1e9
+                        if tts_age <= provider_ref._barge_in_tts_window_s:
+                            # Cancel any stale pending commit before scheduling a new one.
+                            h = provider_ref._pending_barge_in_handle
+                            if h is not None:
+                                try:
+                                    h.cancel()
+                                except Exception:
+                                    pass
+                            loop = asyncio.get_event_loop()
+                            provider_ref._pending_barge_in_handle = loop.call_later(
+                                provider_ref._barge_in_min_vad_s,
+                                provider_ref._commit_barge_in,
+                            )
+                            logger.debug(
+                                "VAD start (tts_age=%.2fs): barge-in pending in %.0f ms",
+                                tts_age, provider_ref._barge_in_min_vad_s * 1000,
+                            )
+                        else:
+                            logger.debug(
+                                "VAD start (tts_age=%.2fs > %.2fs window): no barge-in",
+                                tts_age, provider_ref._barge_in_tts_window_s,
+                            )
 
                 elif isinstance(frame, VADUserStoppedSpeakingFrame):
-                    # Clear barge-in flag so next LLM response audio plays
+                    # If barge-in was pending, cancel it — the VAD burst was
+                    # too short to be real speech (likely echo leakage).
+                    h = provider_ref._pending_barge_in_handle
+                    if h is not None:
+                        try:
+                            h.cancel()
+                        except Exception:
+                            pass
+                        provider_ref._pending_barge_in_handle = None
+                        logger.debug("VAD stop: cancelled pending barge-in (sub-threshold burst)")
+                    # Clear barge-in flag so the bot's remaining / next
+                    # response audio can play. Idempotent — safe when
+                    # the commit never fired.
                     provider_ref._barge_in_active = False
-                    # Stay in listening mode — robot remains attentive
-                    # between utterances.  Listening is only cleared
-                    # while TTS audio is actively playing.
                     provider_ref.deps.movement_manager.set_listening(True)
                     logger.debug("User speech stopped (still listening)")
 
