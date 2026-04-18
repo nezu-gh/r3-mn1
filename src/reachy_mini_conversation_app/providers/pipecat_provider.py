@@ -408,6 +408,21 @@ class PipecatProvider(ConversationProvider):
         else:
             logger.info("Barge-in %s; AEC off", "ON" if self._barge_in_enabled else "OFF")
 
+        # Text-level echo guard — rejects ASR transcripts whose words mostly
+        # match something the robot said in the last few seconds. Catches the
+        # rare echo that slips past the AEC. Off when barge-in is off (there
+        # is no TTS-during-user-speech for this to defend against).
+        self._echo_guard = None
+        if self._barge_in_enabled and os.environ.get("ECHO_GUARD_ENABLED", "1").lower() not in ("0", "false", "no", "off"):
+            from reachy_mini_conversation_app.audio.echo_text_guard import (
+                RecentTTSTextGuard,
+            )
+            self._echo_guard = RecentTTSTextGuard(
+                window_secs=float(os.environ.get("ECHO_GUARD_WINDOW_SECS", "3.0")),
+                threshold=float(os.environ.get("ECHO_GUARD_THRESHOLD", "0.6")),
+            )
+            logger.info("Echo guard enabled (window=3.0s threshold=0.6)")
+
         # Health tracking
         self._frames_dropped: int = 0
         self._last_stt_time: float = 0.0
@@ -845,8 +860,10 @@ class PipecatProvider(ConversationProvider):
             def stop(self) -> None:
                 self._running = False
 
+        provider_ref_for_cleaner = self
+
         class ASRTextCleaner(FrameProcessor):
-            """Strips Qwen ASR prefix tags and filters noise transcriptions."""
+            """Strips Qwen ASR prefix tags, drops noise, and rejects echoes."""
 
             async def process_frame(self, frame: Any, direction: FrameDirection) -> None:
                 await super().process_frame(frame, direction)
@@ -858,6 +875,13 @@ class PipecatProvider(ConversationProvider):
                         text = cleaned
                     if _is_noise(text):
                         logger.debug("ASR noise filtered: %r", text)
+                        return
+                    # Text-level echo guard: drop transcripts that are mostly
+                    # a repeat of recent TTS output (residual speaker→mic
+                    # leakage that the NLMS AEC couldn't fully cancel).
+                    guard = provider_ref_for_cleaner._echo_guard
+                    if guard is not None and guard.looks_like_echo(text):
+                        logger.info("Echo-guard dropped ASR echo: %r", text)
                         return
                 await self.push_frame(frame, direction)
 
@@ -1239,6 +1263,21 @@ class PipecatProvider(ConversationProvider):
                         except asyncio.QueueFull:
                             pass
 
+                # Assistant transcript (what the LLM handed to TTS). Emit per
+                # sentence to the UI and feed the echo-guard so any residual
+                # playback picked up by the mic later can be rejected.
+                elif isinstance(frame, TTSTextFrame):
+                    text = getattr(frame, "text", "") or ""
+                    if text.strip():
+                        if provider_ref._echo_guard is not None:
+                            provider_ref._echo_guard.note(text)
+                        try:
+                            provider_ref.output_queue.put_nowait(
+                                AdditionalOutputs({"role": "assistant", "content": text})
+                            )
+                        except asyncio.QueueFull:
+                            pass  # transcript drop is acceptable
+
                 # VAD speech boundaries → listening mode for movement manager.
                 # The robot should always be listening when idle — only
                 # TTS playback (above) temporarily clears the flag.
@@ -1250,18 +1289,18 @@ class PipecatProvider(ConversationProvider):
                     if provider_ref._doa_tracker is not None:
                         provider_ref._doa_tracker.set_enabled(True)
                     # Barge-in only: cut off the bot's current speech.
+                    # Order matters — set the flag first (blocks the TTS-audio
+                    # branch above from feeding the AEC with frames whose
+                    # audio we're about to discard), then drain downstream
+                    # buffers (our own output queue → robot's GStreamer queue),
+                    # then clear the AEC reference last so it matches the
+                    # (now empty) speaker state. Sparky calls these the same
+                    # atomic block for the same reason.
                     if provider_ref._barge_in_enabled:
                         provider_ref._barge_in_generation += 1
                         provider_ref._barge_in_active = True
-                        # Drop queued speaker reference (we just drained the
-                        # output queue, so those samples won't actually play —
-                        # feeding them as reference would cancel echo that
-                        # isn't there). Keep the learned filter weights.
-                        if provider_ref._aec is not None:
-                            provider_ref._aec.clear_buffer()
-                        # Drain ALL pending audio from the output queue so the
-                        # robot stops talking immediately. Preserve transcript
-                        # AdditionalOutputs (non-audio).
+                        # (1) Drain our fastrtc output queue — preserve
+                        # AdditionalOutputs (non-audio) so transcripts survive.
                         kept: list = []
                         while not provider_ref.output_queue.empty():
                             try:
@@ -1276,7 +1315,7 @@ class PipecatProvider(ConversationProvider):
                                 provider_ref.output_queue.put_nowait(item)
                             except asyncio.QueueFull:
                                 pass  # acceptable during congestion
-                        # Also flush the robot's GStreamer player buffer so
+                        # (2) Flush the robot's GStreamer player buffer so
                         # already-pushed audio stops immediately.
                         clear_fn = getattr(provider_ref, "_clear_queue", None)
                         if clear_fn is not None:
@@ -1284,7 +1323,12 @@ class PipecatProvider(ConversationProvider):
                                 clear_fn()
                             except Exception as exc:
                                 logger.debug("clear_queue during barge-in: %s", exc)
-                        logger.debug("User speech started (barge-in, drained audio + player)")
+                        # (3) Drop queued AEC reference (those samples won't
+                        # actually play, so keeping them would subtract echo
+                        # that isn't there). Keep the learned filter weights.
+                        if provider_ref._aec is not None:
+                            provider_ref._aec.clear_buffer()
+                        logger.debug("User speech started (barge-in: queue + player + AEC cleared)")
 
                 elif isinstance(frame, VADUserStoppedSpeakingFrame):
                     # Clear barge-in flag so next LLM response audio plays
