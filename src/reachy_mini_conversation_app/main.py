@@ -35,6 +35,35 @@ def main() -> None:
     run(args)
 
 
+def _build_handler(provider: str, deps: Any, gradio_mode: bool, instance_path: Optional[str]) -> Any:
+    """Return the conversation handler for *provider*.
+
+    - ``pipecat``: local STT/LLM/TTS via pipecat-ai (requires local_pipeline extra).
+    - ``openai`` (default): OpenAI Realtime, or Gemini Live when MODEL_NAME starts with "gemini-".
+    """
+    import logging
+    from reachy_mini_conversation_app.config import config, is_gemini_model
+
+    logger = logging.getLogger(__name__)
+
+    if provider == "pipecat":
+        from reachy_mini_conversation_app.providers.pipecat_provider import PipecatProvider
+
+        logger.info("Using Pipecat local provider")
+        return PipecatProvider(deps, gradio_mode=gradio_mode, instance_path=instance_path)
+
+    if is_gemini_model():
+        from reachy_mini_conversation_app.gemini_live import GeminiLiveHandler
+
+        logger.info("Using Gemini Live handler for model: %s", config.MODEL_NAME)
+        return GeminiLiveHandler(deps, gradio_mode=gradio_mode, instance_path=instance_path)
+
+    from reachy_mini_conversation_app.openai_realtime import OpenaiRealtimeHandler
+
+    logger.info("Using OpenAI Realtime handler for model: %s", config.MODEL_NAME)
+    return OpenaiRealtimeHandler(deps, gradio_mode=gradio_mode, instance_path=instance_path)
+
+
 def run(
     args: argparse.Namespace,
     robot: ReachyMini = None,
@@ -60,7 +89,26 @@ def run(
         try:
             robot_kwargs = {}
             if args.robot_name is not None:
-                robot_kwargs["robot_name"] = args.robot_name
+                # A value containing "." (IP or mDNS like reachy-mini.local)
+                # means the robot daemon lives on another host — use network mode.
+                if "." in args.robot_name:
+                    robot_kwargs["host"] = args.robot_name
+                    robot_kwargs["connection_mode"] = "network"
+                else:
+                    robot_kwargs["robot_name"] = args.robot_name
+
+            # Pick a media backend the current host can actually serve. The
+            # "default" backend falls back to WebRTC when no local IPC socket
+            # is exposed, which requires gst-plugin-webrtcsink on the client:
+            #   - remote daemon from a laptop/VM → no_media (pipecat's own audio)
+            #   - local daemon on the robot → sounddevice_no_video (ALSA via
+            #     PortAudio; avoids a pointless WebRTC round-trip).
+            is_remote_daemon = args.robot_name is not None and "." in args.robot_name
+            if getattr(args, "provider", "openai") == "pipecat":
+                if is_remote_daemon:
+                    robot_kwargs["media_backend"] = "no_media"
+                else:
+                    robot_kwargs["media_backend"] = "sounddevice_no_video"
 
             logger.info("Initializing ReachyMini (SDK will auto-detect appropriate backend)")
             robot = ReachyMini(**robot_kwargs)
@@ -127,16 +175,7 @@ def run(
     )
     logger.debug(f"Chatbot avatar images: {chatbot.avatar_images}")
 
-    if is_gemini_model():
-        from reachy_mini_conversation_app.gemini_live import GeminiLiveHandler
-
-        logger.info("Using Gemini Live handler for model: %s", config.MODEL_NAME)
-        handler = GeminiLiveHandler(deps, gradio_mode=args.gradio, instance_path=instance_path)
-    else:
-        from reachy_mini_conversation_app.openai_realtime import OpenaiRealtimeHandler
-
-        logger.info("Using OpenAI Realtime handler for model: %s", config.MODEL_NAME)
-        handler = OpenaiRealtimeHandler(deps, gradio_mode=args.gradio, instance_path=instance_path)  # type: ignore[assignment]
+    handler = _build_handler(getattr(args, "provider", "openai"), deps, args.gradio, instance_path)
 
     stream_manager: gr.Blocks | LocalStream | None = None
 
@@ -183,6 +222,14 @@ def run(
             instance_path=instance_path,
         )
 
+    # Wake the robot up so it's ready to interact.
+    try:
+        robot.enable_motors()
+        robot.wake_up()
+        logger.info("Robot woke up successfully")
+    except Exception as e:
+        logger.warning("Failed to wake up robot: %s", e)
+
     # Each async service → its own thread/loop
     movement_manager.start()
     head_wobbler.start()
@@ -208,19 +255,37 @@ def run(
     except KeyboardInterrupt:
         logger.info("Keyboard interruption in main thread... closing server.")
     finally:
-        movement_manager.stop()
-        head_wobbler.stop()
+        # Each cleanup step is independent — one failure must not skip the rest.
+        try:
+            movement_manager.stop()
+        except Exception as e:
+            logger.debug("Cleanup movement_manager failed: %s", e)
+        try:
+            head_wobbler.stop()
+        except Exception as e:
+            logger.debug("Cleanup head_wobbler failed: %s", e)
         if camera_worker:
-            camera_worker.stop()
-
-        # Ensure media is explicitly closed before disconnecting
+            try:
+                camera_worker.stop()
+            except Exception as e:
+                logger.debug("Cleanup camera_worker failed: %s", e)
+        try:
+            robot.goto_sleep()
+        except Exception as e:
+            logger.debug("Cleanup goto_sleep failed: %s", e)
+        try:
+            robot.disable_motors()
+        except Exception as e:
+            logger.debug("Cleanup disable_motors failed: %s", e)
         try:
             robot.media.close()
         except Exception as e:
             logger.debug(f"Error closing media during shutdown: {e}")
 
-        # prevent connection to keep alive some threads
-        robot.client.disconnect()
+        try:
+            robot.client.disconnect()
+        except Exception as e:
+            logger.debug("Cleanup client.disconnect failed: %s", e)
         time.sleep(1)
         logger.info("Shutdown complete.")
 

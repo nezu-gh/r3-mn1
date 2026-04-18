@@ -1,4 +1,5 @@
 from __future__ import annotations
+import os
 import sys
 import logging
 import argparse
@@ -9,6 +10,9 @@ from typing import TYPE_CHECKING, Optional
 from reachy_mini import ReachyMini
 from reachy_mini_conversation_app.camera_worker import CameraWorker
 from reachy_mini_conversation_app.vision.head_tracking import HeadTracker
+
+# Import config early so .env is loaded before parse_args reads os.environ
+import reachy_mini_conversation_app.config  # noqa: F401
 
 
 if TYPE_CHECKING:
@@ -45,6 +49,12 @@ def parse_args() -> tuple[argparse.Namespace, list]:  # type: ignore
         type=str,
         default=None,
         help="[Optional] Robot name to target. Must match the daemon's --robot-name when connecting to a specific robot, mainly useful for development with multiple robots.",
+    )
+    parser.add_argument(
+        "--provider",
+        choices=["openai", "pipecat"],
+        default=os.environ.get("PROVIDER", "openai"),
+        help="Conversation backend. 'pipecat' requires the local_pipeline extra. Env: PROVIDER",
     )
     return parser.parse_known_args()
 

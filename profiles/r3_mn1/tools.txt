@@ -1,0 +1,6 @@
+# Lean pipecat mode doesn't register tools with the LLM. These are listed so
+# the OpenAI provider path and any tool loader still resolve cleanly.
+dance
+play_emotion
+move_head
+do_nothing

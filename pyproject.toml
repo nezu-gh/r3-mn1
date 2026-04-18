@@ -34,6 +34,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+local_pipeline = [
+    "pipecat-ai[silero]>=1.0.0",
+]
 local_vision = [
   "accelerate>=1.13.0",
   "torch>=2.1",
