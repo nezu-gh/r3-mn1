@@ -380,6 +380,26 @@ class PipecatProvider(ConversationProvider):
         self._barge_in_active: bool = False
         self._barge_in_generation: int = 0
 
+        # Acoustic echo canceller — subtracts TTS playback from the mic so
+        # Silero VAD can detect the user's voice over the bot's own speaker.
+        # Without this, the built-in speaker/mic of the Reachy Mini masks
+        # the user during bot speech and barge-in never triggers.
+        from reachy_mini_conversation_app.audio.echo_canceller import (
+            AcousticEchoCanceller,
+        )
+        _aec_enabled = os.environ.get("AEC_ENABLED", "1").lower() not in ("0", "false", "no", "off")
+        self._aec: AcousticEchoCanceller | None = None
+        if _aec_enabled:
+            self._aec = AcousticEchoCanceller(
+                frame_size=int(os.environ.get("AEC_FRAME_SIZE", "160")),
+                filter_length=int(os.environ.get("AEC_FILTER_LENGTH", "3200")),
+                sample_rate=PIPELINE_SAMPLE_RATE,
+                mu=float(os.environ.get("AEC_MU", "0.3")),
+            )
+            logger.info("AEC enabled (NLMS, 16 kHz, 200 ms tail)")
+        else:
+            logger.info("AEC disabled (AEC_ENABLED=0)")
+
         # Health tracking
         self._frames_dropped: int = 0
         self._last_stt_time: float = 0.0
@@ -464,6 +484,11 @@ class PipecatProvider(ConversationProvider):
             if n_samples < 1:
                 return
             audio = resample(audio, n_samples).astype(np.int16)
+
+        # AEC: subtract buffered speaker reference before VAD / STT see the mic.
+        if self._aec is not None:
+            cleaned = self._aec.process_mic_chunk(audio.tobytes())
+            audio = np.frombuffer(cleaned, dtype=np.int16).copy()
 
         logger.debug("receive: sr=%d dtype=%s samples=%d", PIPELINE_SAMPLE_RATE, audio.dtype, len(audio))
         try:
@@ -622,7 +647,21 @@ class PipecatProvider(ConversationProvider):
         # Full mode: 0.1 — reduces false triggers that waste CPU on
         #   ParallelEnricher/IntentRouter/AutoMemoryTap processing
         _vad_min_volume = 0.0 if _is_lean_mode() else 0.1
-        _vad_params = VADParams(min_volume=_vad_min_volume)
+        # Silero confidence: default 0.7 is too strict for barge-in with no
+        # AEC — the speaker leaks into the mic and masks the user's voice
+        # below 0.7 probability. 0.5 is Silero's own recommended default.
+        # start_secs: how long sustained speech must last before VADProcessor
+        # emits VADUserStartedSpeakingFrame. Lower = faster barge-in response
+        # but more false triggers. 0.1 is a decent balance on quiet hardware.
+        _vad_confidence = float(os.environ.get("VAD_CONFIDENCE", "0.5"))
+        _vad_start_secs = float(os.environ.get("VAD_START_SECS", "0.1"))
+        _vad_stop_secs = float(os.environ.get("VAD_STOP_SECS", "0.2"))
+        _vad_params = VADParams(
+            confidence=_vad_confidence,
+            start_secs=_vad_start_secs,
+            stop_secs=_vad_stop_secs,
+            min_volume=_vad_min_volume,
+        )
         vad = VADProcessor(
             vad_analyzer=SileroVADAnalyzer(
                 sample_rate=PIPELINE_SAMPLE_RATE, params=_vad_params,
@@ -1133,6 +1172,17 @@ class PipecatProvider(ConversationProvider):
                     pcm = np.clip(pcm * 2.8, -32768, 32767).astype(np.int16)
                     logger.debug("PipelineSink: TTS frame sr=%d pcm_samples=%d", sr, len(pcm))
 
+                    # Feed the AEC a 16 kHz copy of what's going to the speaker.
+                    # The NLMS filter learns the speaker→mic echo path and the
+                    # mic side (receive()) subtracts it before VAD sees it.
+                    if provider_ref._aec is not None:
+                        if sr != PIPELINE_SAMPLE_RATE:
+                            n_ref = int(len(pcm) * PIPELINE_SAMPLE_RATE / sr)
+                            ref_16k = resample(pcm, n_ref).astype(np.int16)
+                        else:
+                            ref_16k = pcm
+                        provider_ref._aec.feed_speaker_pcm(ref_16k.tobytes())
+
                     # Resample to fastrtc 24 kHz if needed (TTS should
                     # already output 24 kHz, but handle mismatches).
                     if sr != FASTRTC_SAMPLE_RATE:
@@ -1192,6 +1242,13 @@ class PipecatProvider(ConversationProvider):
                         provider_ref.deps.head_wobbler.reset()
                     if provider_ref._doa_tracker is not None:
                         provider_ref._doa_tracker.set_enabled(True)
+                    # Drop queued speaker reference (we just drained the output
+                    # queue, so those samples won't actually play — feeding them
+                    # as reference would cancel echo that isn't there). Keep the
+                    # learned filter weights — the hardware echo path is stable
+                    # across turns, and wiping them forces re-convergence.
+                    if provider_ref._aec is not None:
+                        provider_ref._aec.clear_buffer()
                     # Barge-in: drain ALL pending audio from the output
                     # queue so the robot stops talking immediately.
                     # Preserve transcript AdditionalOutputs (non-audio).

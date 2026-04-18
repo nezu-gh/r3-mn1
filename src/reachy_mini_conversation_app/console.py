@@ -481,7 +481,16 @@ class LocalStream:
         logger.debug(f"Audio recording started at {input_sample_rate} Hz")
 
         while not self._stop_event.is_set():
-            audio_frame = self._robot.media.get_audio_sample()
+            # get_audio_sample can block inside GStreamer appsink.pull; run it
+            # on a thread so the event loop can still service play_loop and
+            # the pipecat pipeline during TTS playback (required for barge-in).
+            try:
+                audio_frame = await asyncio.wait_for(
+                    asyncio.to_thread(self._robot.media.get_audio_sample),
+                    timeout=2.0,
+                )
+            except asyncio.TimeoutError:
+                continue
             if audio_frame is not None:
                 await self.handler.receive((input_sample_rate, audio_frame))
             await asyncio.sleep(0)  # avoid busy loop
@@ -502,6 +511,12 @@ class LocalStream:
                         )
 
             elif isinstance(handler_output, tuple):
+                # Skip audio that was queued just before a barge-in. PipelineSink
+                # already drained on VAD-start, but a frame can slip through
+                # between drain and emit.
+                if getattr(self.handler, "_barge_in_active", False):
+                    continue
+
                 input_sample_rate, audio_data = handler_output
                 output_sample_rate = self._robot.media.get_output_audio_samplerate()
 
@@ -531,7 +546,9 @@ class LocalStream:
                         num_samples,
                     )
 
-                self._robot.media.push_audio_sample(audio_frame)
+                # push_audio_sample blocks on GStreamer appsrc backpressure.
+                # Offload so the event loop can still read the mic during TTS.
+                await asyncio.to_thread(self._robot.media.push_audio_sample, audio_frame)
 
             else:
                 logger.debug("Ignoring output type=%s", type(handler_output).__name__)
